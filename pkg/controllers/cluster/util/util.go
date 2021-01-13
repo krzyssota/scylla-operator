@@ -2,7 +2,11 @@ package util
 
 import (
 	"context"
+	. "github.com/scylladb/scylla-operator/pkg/util/nodeaffinity"
 
+	//	"github.com/scylladb/scylla-operator/pkg/scyllaclient"
+	//	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	//	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"go.uber.org/zap/zapcore"
 	"k8s.io/client-go/kubernetes"
 
@@ -46,6 +50,66 @@ func AreStatefulSetStatusesStale(ctx context.Context, c *scyllav1alpha1.ScyllaCl
 		}
 	}
 	return false, nil
+}
+
+func WillSchedule(ctx context.Context, c *scyllav1alpha1.ScyllaCluster, cl client.Client, logger log.Logger) (bool, error) {
+	nodes := &corev1.NodeList{}
+	if err := cl.List(ctx, nodes); err != nil {
+		return false, errors.Wrap(err, "list nodes")
+	}
+	for _, rack := range c.Spec.Datacenter.Racks { // every rack has to have at least node which taints it tolerates
+		hasNodeToBeScheduledOn := false
+		for _, node := range nodes.Items {
+			taintsPreventScheduling := false
+			for _, taint := range node.Spec.Taints { // for every taint
+				logger.Debug(ctx, "ks406362 taint: ", "k", taint.Key, "v", taint.Value, "e", taint.Effect)
+				if !taintTolerableByRack(ctx, taint, rack, logger) {
+					taintsPreventScheduling = true
+				}
+			}
+			nodeAffinityPreventsScheduling := false
+			if placement := rack.Placement; placement != nil {
+				if nodeAffinity := placement.NodeAffinity; nodeAffinity != nil {
+					logger.Debug(ctx, "ks406362 node aff", "affinit", nodeAffinity)
+					if nodeSelector := nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; nodeSelector != nil {
+						_ns, err := NewNodeSelector(nodeSelector)
+						if err != nil {
+							logger.Error(ctx, "ks406362 NewNodeSelector", "err", err)
+						} else if !_ns.Match(&node) {
+							logger.Debug(ctx, "ks406362 node selector matches")
+							nodeAffinityPreventsScheduling = true
+						}
+					}
+				}
+			}
+			if !taintsPreventScheduling && !nodeAffinityPreventsScheduling {
+				hasNodeToBeScheduledOn = true
+			}
+		}
+		if !hasNodeToBeScheduledOn {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func taintTolerableByRack(ctx context.Context, taint corev1.Taint, rack scyllav1alpha1.RackSpec, logger log.Logger) bool {
+	if taint.Effect == corev1.TaintEffectNoExecute || taint.Effect == corev1.TaintEffectNoSchedule { // that prohibits scheduling/executing
+		if rack.Placement != nil {
+			for _, toleration := range rack.Placement.Tolerations { // there has to be a matching toleration
+				logger.Debug(ctx, "ks406362 tolerations: ", "k", toleration.Key, "v", toleration.Value, "e", toleration.Effect)
+				if (toleration.Operator == corev1.TolerationOpExists && (toleration.Key == taint.Key || toleration.Key == "")) || // key has to match
+					(toleration.Operator == corev1.TolerationOpEqual && toleration.Key == taint.Key && toleration.Value == taint.Value) { // key, value have to match
+					return true //matching toleration
+				}
+			}
+			return false
+		} else {
+			return false // no Placement means no toleration for taint
+		}
+	} else {
+		return true // taint effect doesn't prohibit scheduling
+	}
 }
 
 func GetMemberServicesForRack(ctx context.Context, r scyllav1alpha1.RackSpec, c *scyllav1alpha1.ScyllaCluster, cl client.Client) ([]corev1.Service, error) {

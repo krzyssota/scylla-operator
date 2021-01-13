@@ -3,8 +3,9 @@ package util
 import (
 	"context"
 	"encoding/json"
-
+	"fmt"
 	"github.com/pkg/errors"
+	scyllav1alpha1 "github.com/scylladb/scylla-operator/pkg/api/v1alpha1"
 	"github.com/scylladb/scylla-operator/pkg/naming"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 )
 
 // UpgradeStatefulSetScyllaImage attempts to set the image of a StatefulSet
@@ -34,6 +36,19 @@ func ScaleStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, amount int32
 	}
 	updatedSts.Spec.Replicas = &updatedReplicas
 	err := PatchStatefulSet(ctx, sts, updatedSts, kubeClient)
+	return err
+}
+
+func ScaleStatefulSetsResources(ctx context.Context, sts *appsv1.StatefulSet, newRequirements corev1.ResourceRequirements, kubeClient kubernetes.Interface, c *scyllav1alpha1.ScyllaCluster, r record.EventRecorder) error {
+	updatedSts := sts.DeepCopy()
+	idx, err := naming.FindScyllaContainer(sts.Spec.Template.Spec.Containers)
+	if err != nil {
+		r.Event(c, corev1.EventTypeWarning, naming.ErrSyncFailed, fmt.Sprintf("ks406362 Error trying to find container named scylla to scale it's resources"))
+		return errors.WithStack(err)
+	}
+	updatedSts.Spec.Template.Spec.Containers[idx].Resources.Limits = newRequirements.Limits
+	updatedSts.Spec.Template.Spec.Containers[idx].Resources.Requests = newRequirements.Requests
+	err = PatchStatefulSet(ctx, sts, updatedSts, kubeClient)
 	return err
 }
 

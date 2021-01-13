@@ -18,6 +18,8 @@ package cluster
 
 import (
 	"context"
+	"github.com/scylladb/scylla-operator/pkg/controllers/cluster/util"
+	"github.com/scylladb/scylla-operator/pkg/naming"
 	"reflect"
 	"strings"
 
@@ -116,6 +118,18 @@ func (cc *ClusterReconciler) Reconcile(request ctrl.Request) (ctrl.Result, error
 		// Error reading the object - requeue the request.
 		return reconcile.Result{Requeue: true}, err
 	}
+
+	// Ensure that all Pods have nodes to be scheduled on in terms of node affinity and taints and toleration.
+	nodeAvailableForScheduling, err := util.WillSchedule(ctx, c, cc.Client, cc.Logger)
+	if err != nil {
+		cc.Logger.Error(ctx, "ks406362 WillSchedule returned error", "err", err)
+		return reconcile.Result{Requeue: true}, err
+	} else if !nodeAvailableForScheduling {
+		cc.Logger.Error(ctx, "ks406362 racks do not tolerate taints!")
+		cc.Recorder.Event(c, corev1.EventTypeWarning, naming.ErrSyncFailed, MessagePreferedScheduleFailed)
+		return reconcile.Result{}, errors.Wrap(err, "No node suited for scheduling because of either node affinity or taints and tolerations")
+	}
+	cc.Logger.Debug(ctx, "ks406362 Racks tolerate taints and node affinity is shared")
 
 	logger := cc.Logger.With("cluster", c.Namespace+"/"+c.Name, "resourceVersion", c.ResourceVersion)
 	copy := c.DeepCopy()

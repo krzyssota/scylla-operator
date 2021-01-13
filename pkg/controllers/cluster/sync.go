@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-
 	"github.com/pkg/errors"
 	"github.com/scylladb/go-log"
 	scyllav1alpha1 "github.com/scylladb/scylla-operator/pkg/api/v1alpha1"
@@ -20,6 +19,7 @@ const (
 	MessageUpdateStatusFailed        = "Failed to update status for cluster: %+v"
 	MessageCleanupFailed             = "Failed to clean up cluster resources"
 	MessageClusterSyncFailed         = "Failed to sync cluster, got error: %+v"
+	MessagePreferedScheduleFailed    = "Failed to schedule racks onto available node because of scheduling preferences (taints, tolerations and node affinity)"
 )
 
 // sync attempts to sync the given Scylla Cluster.
@@ -63,6 +63,16 @@ func (cc *ClusterReconciler) sync(c *scyllav1alpha1.ScyllaCluster) error {
 	if err := cc.updateStatus(ctx, c); err != nil {
 		cc.Recorder.Event(c, corev1.EventTypeWarning, naming.ErrSyncFailed, fmt.Sprintf(MessageUpdateStatusFailed, err))
 		return errors.Wrap(err, "failed to update status")
+	}
+
+	for _, rack := range c.Spec.Datacenter.Racks {
+		s := actions.NewState(cc.Client, cc.KubeClient, cc.Recorder)
+		logger.Debug(ctx, "ks406362 Scaling rack resources", "name", rack.Name, "cpu limit", rack.Resources.Limits.Cpu().Value(), "mem limit", rack.Resources.Limits.Memory().MilliValue())
+		act := actions.NewRackScaleResourcesAction(rack, c)
+		if err := act.Execute(ctx, s); err != nil {
+			logger.Error(ctx, "ks406362 Scaling rack error", "err", err)
+		}
+		logger.Debug(ctx, "ks406362 Scaling rack resources AFTER", "name", rack.Name, "cpu limit", rack.Resources.Limits.Cpu().Value(), "mem limit", rack.Resources.Limits.Memory().MilliValue())
 	}
 
 	// Calculate and execute next action

@@ -1,15 +1,31 @@
 package v1alpha1
 
 import (
-	"reflect"
-
+	"context"
+	"encoding/json"
 	"github.com/blang/semver"
 	"github.com/pkg/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
+
+	"github.com/scylladb/go-log"
+	"github.com/scylladb/scylla-operator/pkg/scyllaclient"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/kubernetes"
+	"reflect"
+	"strconv"
 )
 
 func checkValues(c *ScyllaCluster) error {
-	rackNames := sets.NewString()
+
+	ctx := log.WithNewTraceID(context.Background())
+	atom := zap.NewAtomicLevelAt(zapcore.DebugLevel)
+	logger, _ := log.NewProduction(log.Config{
+		Level: atom,
+	})
 
 	if len(c.Spec.ScyllaArgs) > 0 {
 		version, err := semver.Parse(c.Spec.Version)
@@ -17,13 +33,52 @@ func checkValues(c *ScyllaCluster) error {
 			return errors.Errorf("ScyllaArgs is only supported starting from %s", ScyllaVersionThatSupportsArgsText)
 		}
 	}
+	rackNames := sets.NewString()
+
+	// Check that all racks are ready before taking any action
+	for _, rack := range c.Spec.Datacenter.Racks {
+		rackStatus := c.Status.Racks[rack.Name]
+		if rackStatus.Members != rackStatus.ReadyMembers {
+			logger.Info(ctx, "ks406362 Rack is not ready", "name", rack.Name,
+				"members", rackStatus.Members, "ready_members", rackStatus.ReadyMembers)
+			return errors.Errorf("Rack %s is not ready for scaling", rack.Name)
+		}
+	}
+	clientset, err := kubernetes.NewForConfig(config.GetConfigOrDie())
+	if err != nil {
+		return errors.Errorf("ks406362 clientSet creation error %s", err)
+	}
+	willContain, err := willContainLoad(c, logger, ctx, clientset)
+	if err != nil {
+		logger.Error(ctx, "ks406362 willContainLoad error", err)
+		//return errors.Wrap(err, "Failed check of ability to contain load")
+
+	} else if !willContain {
+		logger.Error(ctx, "ks406362 New spec would not contain current load.")
+		return errors.Errorf("New spec would not contain current load")
+	}
 
 	for _, rack := range c.Spec.Datacenter.Racks {
+
 		// Check that no two racks have the same name
 		if rackNames.Has(rack.Name) {
 			return errors.Errorf("two racks have the same name: '%s'", rack.Name)
 		}
 		rackNames.Insert(rack.Name)
+
+		// Check that requested values are not 0
+		requests := rack.Resources.Requests
+		if requests != nil {
+			if requests.Cpu() != nil && requests.Cpu().MilliValue() == 0 {
+				return errors.Errorf("requesting 0 cpus is invalid for rack %s", rack.Name)
+			}
+			if requests.Memory() != nil && requests.Memory().MilliValue() == 0 {
+				return errors.Errorf("requesting 0 memory is invalid for rack %s", rack.Name)
+			}
+			/*if requests.Storage() != nil && requests.Storage().MilliValue() == 0 {
+				return errors.Errorf("requesting 0 storage is invalid for rack %s", rack.Name)
+			}*/
+		}
 
 		// Check that limits are defined
 		limits := rack.Resources.Limits
@@ -120,12 +175,74 @@ func checkTransitions(old, new *ScyllaCluster) error {
 		if !reflect.DeepEqual(oldRack.Storage, newRack.Storage) {
 			return errors.Errorf("rack %s: changes in storage are not currently supported", oldRack.Name)
 		}
-
-		// Check that resources are the same as before
-		if !reflect.DeepEqual(oldRack.Resources, newRack.Resources) {
-			return errors.Errorf("rack %s: changes in resources are not currently supported", oldRack.Name)
-		}
 	}
 
 	return nil
+}
+
+func willContainLoad(c *ScyllaCluster, logger log.Logger, ctx context.Context, clientset *kubernetes.Clientset) (bool, error) {
+	// TODO use function from naming names.go
+	namespace := c.ObjectMeta.Namespace
+	headless := c.ObjectMeta.Name + "-client"
+	clusterName := c.ObjectMeta.Name
+	datacenterName := c.Spec.Datacenter.Name
+
+	secrets := clientset.CoreV1().Secrets(namespace)
+
+	conf := scyllaclient.DefaultConfig()
+	sc, err := scyllaclient.NewClient(conf, logger)
+	if err != nil {
+		return false, errors.Errorf("ks406362 create new scylla client error %s", err)
+	}
+
+	for _, rack := range c.Spec.Datacenter.Racks {
+		scyllaAgentConfig := rack.ScyllaAgentConfig
+		secret, err := secrets.Get(context.TODO(), scyllaAgentConfig, metav1.GetOptions{})
+		bearerToken := ""
+		if err == nil {
+			bearerToken = string(secret.Data["token"])
+
+		}
+		sc.AddBearerToken(bearerToken)
+
+		rackName := rack.Name
+		statusMembers := c.Status.Racks[rackName].Members
+		specMembers := rack.Members
+		capacityStr := rack.Storage.Capacity
+		value, err := resource.ParseQuantity(capacityStr)
+		if err != nil {
+			return false, errors.Errorf("ks406362 Parsing capacity error %s", err)
+		}
+		capacity := value.MilliValue()
+		loadSum := int64(0)
+
+		for i := 0; i < int(statusMembers); i++ { // old number of members
+
+			svc := clusterName + "-" + datacenterName + "-" + rackName + "-" + strconv.Itoa(i)
+			hostName := svc + "." + headless + "." + namespace + ".svc.cluster.local"
+			conf.Hosts = []string{hostName}
+
+			ctx = scyllaclient.ForceHostWrapper(ctx, hostName)
+
+			value, err := sc.StorageServiceLoadGetWrapper(ctx)
+			if err != nil {
+				logger.Error(ctx, "ks406362 StorageServiceLoadGetWrapper", "error", err)
+				return false, errors.Errorf("ks406362 StorageServiceLoadGetWrapper error %s", err)
+			}
+			logger.Info(ctx, "ks406362 getLoad", "name", svc, "value", value, "error", err)
+			load, err := value.GetPayload().(json.Number).Int64()
+			if err != nil {
+				logger.Error(ctx, "ks406362 payload conversion", "error", err)
+				return false, errors.Errorf("ks406362 cannot get int from load interface: error %s", err)
+			}
+			loadSum += load
+		}
+		logger.Info(ctx, "ks406362 loadSum", "sum", loadSum)
+
+		if loadSum > int64(specMembers)*capacity {
+			logger.Error(ctx, "ks406362 unable to store current load in new capacity", "current load", loadSum, "newCapacity", int64(specMembers)*capacity, "error", err)
+			return false, nil
+		}
+	}
+	return true, nil
 }
